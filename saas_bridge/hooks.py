@@ -86,7 +86,7 @@ app_license = "mit"
 # ------------
 
 # before_install = "saas_bridge.install.before_install"
-# after_install = "saas_bridge.install.after_install"
+after_install = "saas_bridge.install.after_install"
 
 # Uninstallation
 # ------------
