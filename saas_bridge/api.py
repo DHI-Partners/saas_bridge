@@ -1,5 +1,5 @@
 import frappe
-from frappe.utils import now, validate_email_address
+from frappe.utils import cint, now, validate_email_address
 from frappe.utils.background_jobs import is_job_enqueued
 
 from saas_bridge import provision
@@ -8,7 +8,6 @@ from saas_bridge import provision
 @frappe.whitelist(methods=["POST"])
 def create_site(
 	site=None,
-	subdomain=None,
 	apps=None,
 	admin_password=None,
 	email=None,
@@ -17,9 +16,6 @@ def create_site(
 	last_name=None,
 ):
 	"""Create a new site with the requested apps and a login for it.
-
-	The site is named either by `site` (a full site name) or by `subdomain`, which is
-	joined to the configured `saas_bridge_domain`.
 
 	Everything is validated here, synchronously, so a bad request fails fast with a real
 	error. The install itself is enqueued: `bench new-site` with a few apps runs for
@@ -31,7 +27,7 @@ def create_site(
 	"""
 	frappe.only_for("System Manager")
 
-	site = provision.ensure_site_available(provision.resolve_site_name(site, subdomain))
+	site = provision.ensure_site_available(provision.normalize_site_name(site))
 	apps = provision.validate_apps(apps)
 
 	# fail here rather than in the worker, where a config gap only surfaces on polling
@@ -106,19 +102,51 @@ def create_site(
 
 
 @frappe.whitelist()
-def get_site_status(site=None, subdomain=None):
-	"""Progress of a `create_site` call: queued, running, success or failed.
-
-	Takes the same `site`/`subdomain` pair as `create_site`, so a caller that provisioned
-	by subdomain can poll by subdomain too.
-	"""
+def get_site_status(site=None):
+	"""Progress of a `create_site` call: queued, running, success or failed."""
 	frappe.only_for("System Manager")
 
-	site = provision.resolve_site_name(site, subdomain)
+	site = provision.normalize_site_name(site)
 	state = provision.get_state(site)
 	if not state:
 		frappe.throw(f"No provisioning run recorded for {site}")
 	return state
+
+
+@frappe.whitelist(methods=["POST"])
+def set_site_language(site=None, language="ru", enabled=1):
+	"""Enable (or disable) a language on a site of this bench — Russian by default.
+
+	Runs synchronously: unlike `bench new-site`, this is one row written on a site that
+	already exists, which fits inside a request.
+
+	The write goes through `frappe.client.set_value` rather than `frappe.db.set_value` so
+	the Language document is saved properly — `on_update` is what drops the cached language
+	list, and without it the target site would keep serving the old set of languages until
+	its cache was cleared by something else.
+	"""
+	frappe.only_for("System Manager")
+
+	site = provision.ensure_site_exists(provision.normalize_site_name(site))
+	language = provision.validate_language(language)
+	enabled = 1 if cint(enabled) else 0
+
+	# fail here rather than inside the subprocess, where a config gap reads as a bench error
+	provision.bench_command()
+
+	try:
+		provision.execute_on_site(
+			site,
+			"frappe.client.set_value",
+			# a dict rather than fieldname/value: `client.set_value` treats a falsy `value`
+			# as "no value given", so passing `enabled=0` positionally would not disable it
+			{"doctype": "Language", "name": language, "fieldname": {"enabled": enabled}},
+			label=f"`bench --site {site} execute` for language {language}",
+		)
+	except provision.ProvisionError as exc:
+		frappe.throw(f"Could not set language {language} on {site}: {exc}")
+
+	return {"site": site, "language": language, "enabled": enabled}
 
 
 @frappe.whitelist()

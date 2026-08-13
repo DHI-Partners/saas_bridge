@@ -23,7 +23,6 @@ site's `site_config.json` first:
 ```json
 {
 	"saas_bridge_db_root_password": "...",
-	"saas_bridge_domain": "example.com",
 	"saas_bridge_allowed_apps": ["erpnext", "hrms"],
 	"saas_bridge_new_site_extra_args": ["--mariadb-user-host-login-scope=%"],
 	"saas_bridge_provision_timeout": 1800,
@@ -31,9 +30,8 @@ site's `site_config.json` first:
 }
 ```
 
-Only `saas_bridge_db_root_password` is required. `saas_bridge_domain` is the domain that
-`subdomain` requests are joined to. `saas_bridge_allowed_apps` restricts what callers may
-install (default: every app on the bench). `saas_bridge_new_site_extra_args` is passed
+Only `saas_bridge_db_root_password` is required. `saas_bridge_allowed_apps` restricts what
+callers may install (default: every app on the bench). `saas_bridge_new_site_extra_args` is passed
 through to `bench new-site` — a docker bench needs
 `--mariadb-user-host-login-scope=%` here, or the new site cannot reach its own database.
 `saas_bridge_bench_command` is only needed when `bench` is neither in the bench's own venv
@@ -46,7 +44,7 @@ curl -X POST https://control.example.com/api/method/saas_bridge.api.create_site 
 	-H "Authorization: token API_KEY:API_SECRET" \
 	-H "Content-Type: application/json" \
 	-d '{
-		"subdomain": "client1",
+		"site": "client1.example.com",
 		"apps": ["erpnext", "hrms"],
 		"admin_password": "s3cret-admin",
 		"email": "owner@client1.com",
@@ -55,14 +53,9 @@ curl -X POST https://control.example.com/api/method/saas_bridge.api.create_site 
 	}'
 ```
 
-Name the site with **either** `subdomain` **or** `site` — passing both is an error.
-`{"subdomain": "client1"}` with `saas_bridge_domain` set to `example.com` creates
-`client1.example.com`.
-
 | Field | Required | Description |
 | --- | --- | --- |
-| `subdomain` | either | One DNS label, joined to `saas_bridge_domain`. |
-| `site` | either | Full site name, when the caller wants to set it outright. |
+| `site` | yes | Full site name, lowercase. |
 | `apps` | no | Apps to install, as a JSON array or a comma separated string. |
 | `admin_password` | no | Administrator password. Generated and returned if omitted. |
 | `email` | no | Login to create as System Manager on the new site. |
@@ -77,16 +70,12 @@ with a few apps runs well past the HTTP timeout:
 	"login": "owner@client1.com", "status": "queued", "job_id": "..."}}
 ```
 
-`site` in the response is the resolved name, so a caller that provisioned by subdomain
-learns the full site name it ended up with.
-
 Generated passwords are returned in this response only — they are never stored, so this is
 the caller's one chance to keep them.
 
-**`GET /api/method/saas_bridge.api.get_site_status?subdomain=client1`**
+**`GET /api/method/saas_bridge.api.get_site_status?site=client1.example.com`**
 
-Polls the run: `queued`, `running`, `success` or `failed`. Accepts `site` or `subdomain`,
-the same as `create_site`. A failed run carries the bench error in `error`, with passwords
+Polls the run: `queued`, `running`, `success` or `failed`. A failed run carries the bench error in `error`, with passwords
 scrubbed out. Run state is kept for 24 hours.
 
 A failed `bench new-site` leaves a half-built site directory behind, which would block
@@ -95,6 +84,31 @@ every later attempt at that name. The failure path therefore moves it into
 the same name can simply be retried. Only a directory this run created is ever touched.
 On a containerised bench, note that `archived/` is usually not on the shared sites volume,
 so those archives live inside the container that did the work.
+
+**`POST /api/method/saas_bridge.api.set_site_language`**
+
+Enables a language on a site of this bench — Russian unless another one is asked for.
+
+```bash
+curl -X POST https://control.example.com/api/method/saas_bridge.api.set_site_language \
+	-H "Authorization: token API_KEY:API_SECRET" \
+	-H "Content-Type: application/json" \
+	-d '{"site": "client1.example.com", "language": "ru"}'
+```
+
+```json
+{"message": {"site": "client1.example.com", "language": "ru", "enabled": 1}}
+```
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `site` | yes | The site to act on. |
+| `language` | no | Language code, defaults to `ru`. Must already exist on the target site. |
+| `enabled` | no | `1` to enable (default), `0` to disable. |
+
+The site must already exist. Unlike `create_site` this runs synchronously — it is one row
+written on a live site, a few seconds — so the response reports the finished state rather
+than a job to poll. `saas_bridge_site_command_timeout` (default 300 seconds) caps it.
 
 **`GET /api/method/saas_bridge.api.get_available_apps`**
 

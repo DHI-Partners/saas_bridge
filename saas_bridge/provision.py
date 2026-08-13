@@ -9,6 +9,7 @@ they are therefore briefly visible in `ps` on the provisioning host. They are sc
 out of anything that gets stored or logged.
 """
 
+import json
 import os
 import re
 import shutil
@@ -17,13 +18,13 @@ import subprocess
 import frappe
 from frappe.utils import cint, get_bench_path, now
 
-# 253 chars is the DNS limit for a whole name; the 63 char limit is per label and belongs
-# on the subdomain, so that joining a long slug to a long domain still validates
+# 253 chars is the DNS limit for a whole name
 SITE_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]{0,252}$")
-# a single DNS label: no dots, so a subdomain can never reach outside the configured domain
-SUBDOMAIN_PATTERN = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
+# the same pattern frappe's own Language doctype validates its code with
+LANGUAGE_CODE_PATTERN = re.compile(r"^[a-zA-Z]+[-_]*[a-zA-Z]+$")
 MIN_PASSWORD_LENGTH = 8
 DEFAULT_TIMEOUT = 30 * 60
+DEFAULT_COMMAND_TIMEOUT = 5 * 60
 STATE_TTL = 24 * 60 * 60
 
 
@@ -56,47 +57,40 @@ def normalize_site_name(site):
 	reaching argv as an option or escaping the sites directory.
 	"""
 	site = (site or "").strip().lower().rstrip(".")
+	if not site:
+		frappe.throw("`site` is required")
 	if not SITE_NAME_PATTERN.match(site) or ".." in site:
 		frappe.throw(f"Invalid site name {site!r}: use lowercase letters, digits, dots and hyphens only")
 	return site
-
-
-def provisioning_domain():
-	domain = (frappe.conf.get("saas_bridge_domain") or "").strip().lower().strip(".")
-	if not domain:
-		frappe.throw("`subdomain` requires `saas_bridge_domain` to be set in site config")
-	return domain
-
-
-def validate_subdomain(subdomain):
-	subdomain = (subdomain or "").strip().lower().strip(".")
-	if not SUBDOMAIN_PATTERN.match(subdomain):
-		frappe.throw(
-			f"Invalid subdomain {subdomain!r}: one label of lowercase letters, digits and "
-			f"hyphens, without dots"
-		)
-	return subdomain
-
-
-def resolve_site_name(site=None, subdomain=None):
-	"""Work out the site to create from either a full name or a subdomain.
-
-	`subdomain` is joined to the configured `saas_bridge_domain`, so a caller who only
-	knows the tenant's slug never has to know the platform's domain.
-	"""
-	if site and subdomain:
-		frappe.throw("Pass either `site` or `subdomain`, not both")
-	if subdomain:
-		return normalize_site_name(f"{validate_subdomain(subdomain)}.{provisioning_domain()}")
-	if not site:
-		frappe.throw("Either `site` or `subdomain` is required")
-	return normalize_site_name(site)
 
 
 def ensure_site_available(site):
 	if os.path.exists(os.path.join(get_bench_path(), "sites", site)):
 		frappe.throw(f"Site {site} already exists on this bench")
 	return site
+
+
+def ensure_site_exists(site):
+	"""The opposite check: for calls that act on a site that must already be there."""
+	if not os.path.exists(os.path.join(get_bench_path(), "sites", site)):
+		frappe.throw(f"Site {site} does not exist on this bench")
+	return site
+
+
+def validate_language(language):
+	"""Check a language code before it reaches another site's `bench execute`.
+
+	Language records are named by their code, so this is both the record name and — since
+	`bench execute` evaluates its `--kwargs` as python — the only thing standing between a
+	request and code running in the target site.
+	"""
+	language = (language or "").strip()
+	if not LANGUAGE_CODE_PATTERN.match(language):
+		frappe.throw(
+			f"Invalid language code {language!r}: letters only, optionally joined by a "
+			f"hyphen or underscore, such as `ru` or `pt-BR`"
+		)
+	return language
 
 
 def validate_apps(apps):
@@ -168,6 +162,15 @@ def bench_command():
 def step_timeout():
 	"""Seconds a single bench step may take before it is killed."""
 	return cint(frappe.conf.get("saas_bridge_provision_timeout")) or DEFAULT_TIMEOUT
+
+
+def command_timeout():
+	"""Seconds a short `bench --site ... execute` may take before it is killed.
+
+	Much shorter than `step_timeout`: these calls run inside a web request, and all they do
+	is boot a site and write one row.
+	"""
+	return cint(frappe.conf.get("saas_bridge_site_command_timeout")) or DEFAULT_COMMAND_TIMEOUT
 
 
 def db_root_password():
@@ -280,6 +283,27 @@ def run(args, label, secrets, timeout):
 		raise ProvisionError(scrub(detail, secrets) or f"bench exited with code {result.returncode}")
 
 	return scrub(result.stdout or "", secrets)
+
+
+def execute_on_site(site, method, kwargs=None, label=None):
+	"""Call a python method inside another site's context, via `bench --site X execute`.
+
+	It has to be a subprocess. `frappe.init(other_site)` would rebind the site globals of
+	the process that calls it, which in a web request means tearing the current request's
+	own site context out from under it. A `bench` child gets its own globals and its own
+	database connection, and `bench execute` commits before it exits.
+
+	Only methods of apps installed on the *target* site can be run this way, so the method
+	is a frappe one rather than something out of this app: `frappe.get_attr` refuses
+	anything else.
+	"""
+	args = [bench_command(), "--site", site, "execute", method]
+	if kwargs:
+		# bench evaluates this as python, which json.dumps output is a valid subset of as
+		# long as no value is a bool or None — keep the callers passing ints and strings
+		args += ["--kwargs", json.dumps(kwargs)]
+
+	return run(args, label or f"`bench --site {site} execute {method}`", [], command_timeout())
 
 
 # --- the job ---------------------------------------------------------------
