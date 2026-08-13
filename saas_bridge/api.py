@@ -150,6 +150,18 @@ def set_site_language(site=None, language="ru", enabled=1):
 
 
 @frappe.whitelist()
+def get_sites():
+	"""Sites that already exist on this bench.
+
+	Only used to fill the site field on the desk page — every endpoint still takes a site
+	name outright, so nothing depends on this list.
+	"""
+	frappe.only_for("System Manager")
+
+	return provision.list_sites()
+
+
+@frappe.whitelist()
 def get_available_apps():
 	"""Apps that `create_site` will accept on this bench."""
 	frappe.only_for("System Manager")

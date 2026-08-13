@@ -77,6 +77,21 @@ def ensure_site_exists(site):
 	return site
 
 
+def list_sites():
+	"""Site names on this bench, for the desk page to offer.
+
+	The sites directory also holds `assets`, `apps.txt` and the shared config, so a site is
+	recognised by its own `site_config.json` rather than by being a directory.
+	"""
+	sites_path = os.path.join(get_bench_path(), "sites")
+	sites = [
+		entry
+		for entry in os.listdir(sites_path)
+		if os.path.exists(os.path.join(sites_path, entry, "site_config.json"))
+	]
+	return sorted(sites)
+
+
 def validate_language(language):
 	"""Check a language code before it reaches another site's `bench execute`.
 

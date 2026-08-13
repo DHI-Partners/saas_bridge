@@ -12,6 +12,21 @@ bench get-app $URL_OF_THIS_REPO --branch version-16
 bench install-app saas_bridge
 ```
 
+### Desk interface
+
+Installing the app puts a **SaaS Bridge** workspace in the sidebar with a **Site Manager**
+page (`/app/site-manager`) behind it — the same two operations as the API, as forms:
+
+- **Create a site** — name, apps, and an optional System Manager login. Passwords left
+  empty are generated and shown once, and the run's progress is polled below the form
+  until it succeeds or fails.
+- **Site language** — enables a language on a site that already exists, Russian by
+  default.
+
+Both are limited to the `System Manager` role, the same as the endpoints they call. Run
+`bench --site <control-site> migrate` after installing or updating the app, otherwise the
+page and the workspace are not registered on the site yet.
+
 ### Site provisioning API
 
 Creates a new site on the same bench with the apps given in the request, an Administrator
@@ -113,6 +128,11 @@ than a job to poll. `saas_bridge_site_command_timeout` (default 300 seconds) cap
 **`GET /api/method/saas_bridge.api.get_available_apps`**
 
 Lists the apps `create_site` will accept on this bench.
+
+**`GET /api/method/saas_bridge.api.get_sites`**
+
+Lists the sites that already exist on this bench. Only there to fill the site field on the
+Site Manager page — every other endpoint takes a site name outright.
 
 Note that the new site still needs to be routable — run `bench setup nginx` and point DNS
 at the host, or the site will only answer on the bench's own port.
