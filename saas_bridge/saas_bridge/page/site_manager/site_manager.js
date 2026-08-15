@@ -20,6 +20,7 @@ saas_bridge.SiteManager = class SiteManager {
 		this.page = page;
 		this.wrapper = wrapper;
 		this.sites = [];
+		this.sites_info = [];
 		this.available_apps = [];
 		this.setup();
 	}
@@ -32,6 +33,7 @@ saas_bridge.SiteManager = class SiteManager {
 		// the start and only a later refresh has to push new options into a live field
 		await Promise.all([this.load_apps(), this.load_sites()]);
 
+		this.render_sites_section();
 		this.render_create_section();
 		this.render_language_section();
 	}
@@ -44,15 +46,17 @@ saas_bridge.SiteManager = class SiteManager {
 	}
 
 	async load_sites() {
-		const r = await frappe.call("saas_bridge.api.get_sites");
-		this.sites = (r && r.message) || [];
+		const r = await frappe.call("saas_bridge.api.get_sites_info");
+		this.sites_info = (r && r.message) || [];
+		this.sites = this.sites_info.map((info) => info.site);
 
-		// the field is built once, so an added site has to be pushed into it by hand
+		// both are built once, so a site added later has to be pushed into them by hand
 		const field = this.language_form && this.language_form.get_field("site");
 		if (field) {
 			field.df.options = this.sites;
 			field.set_data && field.set_data(this.sites);
 		}
+		if (this.$sites_table) this.render_sites_table();
 	}
 
 	// --- layout -------------------------------------------------------------
@@ -73,6 +77,129 @@ saas_bridge.SiteManager = class SiteManager {
 			action: $card.find(".action-area"),
 			result: $card.find(".result-area"),
 		};
+	}
+
+	render_sites_section() {
+		const areas = this.card(
+			__("Sites"),
+			__("Every site on this bench, as its own database describes it. Click a row for the rest.")
+		);
+		this.$sites_table = areas.result;
+		this.render_sites_table();
+	}
+
+	render_sites_table() {
+		if (!this.sites_info.length) {
+			this.$sites_table.html(`<div class="text-muted">${__("No sites on this bench yet.")}</div>`);
+			return;
+		}
+
+		// the app list and the language list are both long enough to wrap a narrow desk into
+		// something unreadable, so the row stays to counts and the detail carries the names
+		this.$sites_table.html(`
+			<div style="overflow-x: auto;">
+				<table class="table table-sm" style="margin-bottom: 0;">
+					<thead>
+						<tr class="text-muted">
+							<th>${__("Site")}</th>
+							<th class="text-right">${__("Apps")}</th>
+							<th class="text-right">${__("Users")}</th>
+							<th>${__("Language")}</th>
+							<th>${__("Created")}</th>
+							<th></th>
+						</tr>
+					</thead>
+					<tbody>${this.sites_info.map((info) => this.site_rows(info)).join("")}</tbody>
+				</table>
+			</div>
+		`);
+
+		this.$sites_table.find("tr.site-row").on("click", (e) => {
+			$(e.currentTarget).next(".site-detail").toggleClass("hide");
+		});
+
+		this.$sites_table.find(".site-pick").on("click", (e) => {
+			e.stopPropagation();
+			const site = $(e.currentTarget).attr("data-site");
+			this.language_form.set_value("site", site);
+			frappe.show_alert({ message: __("{0} picked below", [site]), indicator: "blue" });
+		});
+	}
+
+	site_rows(info) {
+		const esc = frappe.utils.escape_html;
+		const pill = (color, text) => `<span class="indicator-pill ${color}">${esc(text)}</span> `;
+
+		let flags = "";
+		if (info.error) flags += pill("red", __("unreachable"));
+		if (info.maintenance_mode) flags += pill("orange", __("maintenance"));
+		if (info.scheduler_paused) flags += pill("gray", __("scheduler paused"));
+		if (info.last_run && info.last_run.status !== "success") {
+			flags += pill(info.last_run.status === "failed" ? "red" : "blue", info.last_run.status);
+		}
+		if (info.site === frappe.boot.sitename) flags += pill("gray", __("this site"));
+
+		const languages = (info.enabled_languages || []).length;
+		const detail = (label, value) =>
+			value ? `<div><span class="text-muted">${esc(label)}:</span> ${esc(String(value))}</div>` : "";
+
+		return `
+			<tr class="site-row" style="cursor: pointer;">
+				<td><b>${esc(info.site)}</b> ${flags}</td>
+				<td class="text-right">${(info.apps || []).length || "—"}</td>
+				<td class="text-right">${
+					info.users === undefined
+						? "—"
+						: info.users +
+							(info.website_users ? ` <span class="text-muted">+${info.website_users} ${__("web")}</span>` : "")
+				}</td>
+				<td>${esc(info.default_language || "—")}${languages ? ` <span class="text-muted">(${languages} ${__("enabled")})</span>` : ""}</td>
+				<td class="text-muted">${info.created ? frappe.datetime.comment_when(info.created) : "—"}</td>
+				<td class="text-right">
+					<button class="btn btn-xs btn-default site-pick" data-site="${esc(info.site)}">${__("Set language")}</button>
+				</td>
+			</tr>
+			<tr class="site-detail hide">
+				<td colspan="6" class="small">
+					${this.user_detail(info)}
+					${detail(__("Apps"), (info.apps || []).join(", "))}
+					${detail(__("Enabled languages"), (info.enabled_languages || []).join(", "))}
+					${detail(__("Database"), info.db_name)}
+					${detail(__("Created"), info.created)}
+					${info.last_run ? detail(__("Last provisioning run"), `${info.last_run.status}${info.last_run.error ? " — " + info.last_run.error : ""}`) : ""}
+					${info.error ? `<div class="text-danger">${esc(info.error)}</div>` : ""}
+				</td>
+			</tr>
+		`;
+	}
+
+	user_detail(info) {
+		if (info.users === undefined) return "";
+
+		const esc = frappe.utils.escape_html;
+		const counts = [`${info.users} ${__("system")}`];
+		if (info.website_users) counts.push(`${info.website_users} ${__("website")}`);
+		if (info.disabled_users) counts.push(`${info.disabled_users} ${__("disabled")}`);
+
+		// the query is capped, so say when a site has more logins than the list shows rather
+		// than let twenty look like the whole staff
+		const listed = info.user_list || [];
+		const more = info.users > listed.length ? ` ${__("and {0} more", [info.users - listed.length])}` : "";
+		const names = listed
+			.map(
+				(user) =>
+					`<div>${esc(user.full_name || user.name)} <span class="text-muted">${esc(user.name)} — ${
+						user.last_active
+							? __("last active {0}", [frappe.datetime.comment_when(user.last_active)])
+							: __("never signed in")
+					}</span></div>`
+			)
+			.join("");
+
+		return `
+			<div><span class="text-muted">${__("Users")}:</span> ${esc(counts.join(", "))}${more}</div>
+			<div class="ml-3 mb-2">${names}</div>
+		`;
 	}
 
 	render_create_section() {

@@ -92,6 +92,16 @@ def list_sites():
 	return sorted(sites)
 
 
+def site_config(site):
+	"""A site's own `site_config.json`, or an empty dict when it cannot be read."""
+	path = os.path.join(get_bench_path(), "sites", site, "site_config.json")
+	try:
+		with open(path) as config_file:
+			return json.load(config_file)
+	except (OSError, ValueError):
+		return {}
+
+
 def validate_language(language):
 	"""Check a language code before it reaches another site's `bench execute`.
 
@@ -153,6 +163,102 @@ def set_state(site, **changes):
 	state.update(changes)
 	frappe.cache.set_value(state_key(site), state, expires_in_sec=STATE_TTL)
 	return state
+
+
+# --- reading other sites ---------------------------------------------------
+
+
+def site_database(conf):
+	"""Open a connection to another site's database, using that site's own credentials.
+
+	Reading a site this way rather than through `bench --site X execute` is what makes a
+	list of every site on the bench affordable: a bench subprocess costs seconds per site,
+	a connection costs milliseconds. It is only ever used for the read-only queries below —
+	anything that writes still goes through bench, where frappe's own document machinery
+	runs.
+
+	The connection is deliberately separate from `frappe.local.db`: the current request
+	keeps its own site's connection untouched.
+	"""
+	from frappe.database import get_db
+
+	db = get_db(
+		socket=conf.get("db_socket") or frappe.conf.db_socket,
+		host=conf.get("db_host") or frappe.conf.db_host,
+		port=conf.get("db_port") or frappe.conf.db_port,
+		user=conf.get("db_name"),
+		password=conf.get("db_password"),
+		cur_db_name=conf.get("db_name"),
+	)
+	db.connect()
+	return db
+
+
+def read_site_details(conf):
+	"""What a site's own database says about it."""
+	db = site_database(conf)
+	try:
+		return {
+			"apps": [row[0] for row in db.sql("select app_name from `tabInstalled Application` order by idx")],
+			# Administrator counts: it is the login the site was created with, and leaving it
+			# out reports a brand new site as having no users at all. Guest never does — it
+			# is a fixture, not an account anyone holds
+			"users": db.sql(
+				"select count(*) from `tabUser` where enabled = 1 and user_type = 'System User' and name != 'Guest'"
+			)[0][0],
+			"website_users": db.sql(
+				"select count(*) from `tabUser` where enabled = 1 and user_type = 'Website User' and name != 'Guest'"
+			)[0][0],
+			"disabled_users": db.sql(
+				"select count(*) from `tabUser` where enabled = 0 and name != 'Guest'"
+			)[0][0],
+			"user_list": db.sql(
+				"""select name, full_name, last_active from `tabUser`
+				where enabled = 1 and user_type = 'System User' and name != 'Guest'
+				order by creation limit 20""",
+				as_dict=True,
+			),
+			# the install stamps Administrator when the site is built, which is the closest
+			# thing a site has to its own creation date
+			"created": db.sql("select creation from `tabUser` where name = 'Administrator'")[0][0],
+			"default_language": (
+				db.sql("select value from `tabSingles` where doctype = 'System Settings' and field = 'language'")
+				or [[None]]
+			)[0][0],
+			"enabled_languages": [
+				row[0] for row in db.sql("select name from `tabLanguage` where enabled = 1 order by name")
+			],
+		}
+	finally:
+		db.close()
+
+
+def describe_site(site):
+	"""Everything the desk page shows about one site.
+
+	A site that cannot be read is still listed, with the reason in `error` — one broken
+	site must not blank out the whole list.
+	"""
+	conf = site_config(site)
+	details = {
+		"site": site,
+		"db_name": conf.get("db_name"),
+		"maintenance_mode": cint(conf.get("maintenance_mode")),
+		"scheduler_paused": cint(conf.get("pause_scheduler")),
+		"last_run": get_state(site),
+		"error": None,
+	}
+
+	try:
+		details.update(read_site_details(conf))
+	except Exception as exc:
+		details["error"] = str(exc)
+
+	return details
+
+
+def describe_sites():
+	return [describe_site(site) for site in list_sites()]
 
 
 # --- bench plumbing --------------------------------------------------------

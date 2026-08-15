@@ -15,8 +15,13 @@ bench install-app saas_bridge
 ### Desk interface
 
 Installing the app puts a **SaaS Bridge** workspace in the sidebar with a **Site Manager**
-page (`/app/site-manager`) behind it — the same two operations as the API, as forms:
+page (`/app/site-manager`) behind it:
 
+- **Sites** — every site on the bench with its apps, users, default language, creation
+  date and any maintenance, scheduler or failed-run flags. A row opens for the logins
+  themselves and when they were last active, the full app and language lists, the database
+  name and the last provisioning run; **Set language** on a row fills the form below it. A site whose database cannot be read is still listed,
+  marked `unreachable` with the reason in its detail.
 - **Create a site** — name, apps, and an optional System Manager login. Passwords left
   empty are generated and shown once, and the run's progress is polled below the form
   until it succeeds or fails.
@@ -131,8 +136,34 @@ Lists the apps `create_site` will accept on this bench.
 
 **`GET /api/method/saas_bridge.api.get_sites`**
 
-Lists the sites that already exist on this bench. Only there to fill the site field on the
-Site Manager page — every other endpoint takes a site name outright.
+Lists the names of the sites that already exist on this bench.
+
+**`GET /api/method/saas_bridge.api.get_sites_info`**
+
+The same sites, each with what its own database says about it — this is what the Sites
+table on the desk page shows:
+
+```json
+{"message": [{"site": "client1.example.com", "db_name": "_946076741d067568",
+	"apps": ["frappe", "erpnext"], "created": "2026-08-13 17:51:47.395286",
+	"users": 3, "website_users": 140, "disabled_users": 1,
+	"user_list": [{"name": "owner@client1.com", "full_name": "Owner", "last_active": "..."}],
+	"default_language": "ru", "enabled_languages": ["en", "ru"],
+	"maintenance_mode": 0, "scheduler_paused": 0, "last_run": null, "error": null}]}
+```
+
+`users` counts enabled System Users, `Administrator` included and `Guest` excluded — a
+freshly created site therefore reports one user rather than none. `user_list` holds the
+first twenty of them.
+
+Apps, users and languages are read by connecting to each site's database with the
+credentials from its own `site_config.json`, not by running `bench --site X` per site: a
+bench subprocess costs seconds per site, a connection costs milliseconds. The connection is
+read-only and separate from the request's own — every write still goes through bench.
+
+A site that cannot be read keeps its row, with the reason in `error` and the database
+fields missing. `last_run` carries the `get_site_status` state when the site was
+provisioned through this app within the last 24 hours.
 
 Note that the new site still needs to be routable — run `bench setup nginx` and point DNS
 at the host, or the site will only answer on the bench's own port.

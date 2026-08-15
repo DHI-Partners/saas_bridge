@@ -162,6 +162,19 @@ def get_sites():
 
 
 @frappe.whitelist()
+def get_sites_info():
+	"""Every site on this bench with what its own database says about it.
+
+	Apps, users, languages and the site's creation date are read straight from each site's
+	database rather than through `bench --site X execute`, which would cost seconds per
+	site. A site that cannot be read is still listed, with the reason in `error`.
+	"""
+	frappe.only_for("System Manager")
+
+	return provision.describe_sites()
+
+
+@frappe.whitelist()
 def get_available_apps():
 	"""Apps that `create_site` will accept on this bench."""
 	frappe.only_for("System Manager")
