@@ -23,6 +23,13 @@ SITE_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9.-]{0,252}$")
 # the same pattern frappe's own Language doctype validates its code with
 LANGUAGE_CODE_PATTERN = re.compile(r"^[a-zA-Z]+[-_]*[a-zA-Z]+$")
 MIN_PASSWORD_LENGTH = 8
+# the contract with the tenant side: this app writes this key into a site's config,
+# `habibi_core.limits` reads it there and enforces the seat count. Neither app needs to
+# know anything else about the other — raising a limit is a config write, not a deployment.
+MAX_USERS_KEY = "saas_bridge_max_users"
+# the app that enforces the limit on the site itself. A site without it takes the config
+# key and ignores it, which is worth saying out loud rather than leaving to be discovered
+LIMIT_ENFORCED_BY = "habibi_core"
 DEFAULT_TIMEOUT = 30 * 60
 DEFAULT_COMMAND_TIMEOUT = 5 * 60
 STATE_TTL = 24 * 60 * 60
@@ -140,6 +147,24 @@ def validate_apps(apps):
 	return validated
 
 
+def validate_limits(max_users=None):
+	"""Check the limit keys before they are written into a site's config.
+
+	Returns a dict rather than a number: it is what `set_site_config_values` writes, and
+	the day a second limit exists it lands here without changing its callers.
+	"""
+	values = {}
+
+	if max_users not in (None, ""):
+		max_users = cint(max_users)
+		# a site always holds Administrator, so a limit below one could never be satisfied
+		if max_users < 1:
+			frappe.throw("`max_users` must be at least 1")
+		values[MAX_USERS_KEY] = max_users
+
+	return values
+
+
 def validate_password(password, label):
 	if not password or len(password) < MIN_PASSWORD_LENGTH:
 		frappe.throw(f"{label} must be at least {MIN_PASSWORD_LENGTH} characters long")
@@ -194,6 +219,41 @@ def site_database(conf):
 	return db
 
 
+def set_site_config_values(site, values):
+	"""Write keys into another site's `site_config.json` via `bench set-config`.
+
+	Written from here rather than into a doctype on the site itself: the tenant's own
+	System Manager can edit anything inside their database, permissions included, but has
+	no way to reach this file. A limit that the limited party can raise is not a limit.
+
+	`--parse` makes bench store a number as a number, so a caller reading the config back
+	gets `10` rather than `"10"`.
+	"""
+	for key, value in values.items():
+		args = [bench_command(), "--site", site, "set-config", key, str(value)]
+		if isinstance(value, int) and not isinstance(value, bool):
+			args.append("--parse")
+		run(args, f"`bench --site {site} set-config {key}`", [], command_timeout())
+
+	return values
+
+
+def clear_site_cache(site):
+	"""Drop the target site's caches, hooks included.
+
+	Frappe keeps each site's resolved `hooks.py` in redis, and a site that cached them
+	before the enforcing app was deployed goes on running without its hooks until
+	something clears it. Setting a limit and having the site quietly ignore it is the one
+	failure here that gives no sign at all, so the write pays for the extra second.
+	"""
+	run(
+		[bench_command(), "--site", site, "clear-cache"],
+		f"`bench --site {site} clear-cache`",
+		[],
+		command_timeout(),
+	)
+
+
 def read_site_details(conf):
 	"""What a site's own database says about it."""
 	db = site_database(conf)
@@ -233,6 +293,23 @@ def read_site_details(conf):
 		db.close()
 
 
+def site_apps(site):
+	"""Apps installed on another site, or an empty list when it cannot be read.
+
+	Its own query rather than `read_site_details`, which asks four more things a caller
+	checking for one app has no use for.
+	"""
+	try:
+		db = site_database(site_config(site))
+	except Exception:
+		return []
+
+	try:
+		return [row[0] for row in db.sql("select app_name from `tabInstalled Application`")]
+	finally:
+		db.close()
+
+
 def describe_site(site):
 	"""Everything the desk page shows about one site.
 
@@ -245,6 +322,8 @@ def describe_site(site):
 		"db_name": conf.get("db_name"),
 		"maintenance_mode": cint(conf.get("maintenance_mode")),
 		"scheduler_paused": cint(conf.get("pause_scheduler")),
+		# the limit this app writes and habibi_core enforces on the site itself
+		"max_users": cint(conf.get(MAX_USERS_KEY)) or None,
 		"last_run": get_state(site),
 		"error": None,
 	}
@@ -253,6 +332,12 @@ def describe_site(site):
 		details.update(read_site_details(conf))
 	except Exception as exc:
 		details["error"] = str(exc)
+
+	# None rather than False when the site could not be read: not knowing whether a limit
+	# is enforced is a different thing from knowing that it is not
+	details["limit_enforced"] = (
+		None if details.get("apps") is None else LIMIT_ENFORCED_BY in details["apps"]
+	)
 
 	return details
 
@@ -430,11 +515,20 @@ def execute_on_site(site, method, kwargs=None, label=None):
 # --- the job ---------------------------------------------------------------
 
 
-def provision_site(site, apps, admin_password, email=None, password=None, first_name=None, last_name=None):
+def provision_site(
+	site,
+	apps,
+	admin_password,
+	email=None,
+	password=None,
+	first_name=None,
+	last_name=None,
+	limits=None,
+):
 	"""Background job: create the site, install the apps, then add the login.
 
-	Runs the two bench steps in order so a failure to add the login still leaves a
-	usable site reachable with the Administrator password.
+	Runs the bench steps in order so a failure to add the login still leaves a usable site
+	reachable with the Administrator password.
 	"""
 	timeout = step_timeout()
 	secrets = [admin_password, password]
@@ -481,6 +575,12 @@ def provision_site(site, apps, admin_password, email=None, password=None, first_
 
 			run(add_login, f"`bench add-system-manager {email}`", secrets, timeout)
 			set_state(site, login_created=email)
+
+		# written last, after the site's own first login exists: a limit of one user would
+		# otherwise have the new site refuse the login this very job is adding
+		if limits:
+			set_site_config_values(site, limits)
+			set_state(site, limits=limits)
 
 	except Exception as exc:
 		message = scrub(str(exc), secrets)

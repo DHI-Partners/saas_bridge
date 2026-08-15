@@ -20,15 +20,17 @@ page (`/app/site-manager`) behind it:
 - **Sites** — every site on the bench with its apps, users, default language, creation
   date and any maintenance, scheduler or failed-run flags. A row opens for the logins
   themselves and when they were last active, the full app and language lists, the database
-  name and the last provisioning run; **Set language** on a row fills the form below it. A site whose database cannot be read is still listed,
-  marked `unreachable` with the reason in its detail.
+  name and the last provisioning run; **Pick** on a row fills the forms below it with that
+  site and its current limit. A site whose database cannot be read is still listed, marked
+  `unreachable` with the reason in its detail.
 - **Create a site** — name, apps, and an optional System Manager login. Passwords left
   empty are generated and shown once, and the run's progress is polled below the form
   until it succeeds or fails.
+- **User limit** — writes the seat limit into a site's own config.
 - **Site language** — enables a language on a site that already exists, Russian by
   default.
 
-Both are limited to the `System Manager` role, the same as the endpoints they call. Run
+All of them are limited to the `System Manager` role, the same as the endpoints they call. Run
 `bench --site <control-site> migrate` after installing or updating the app, otherwise the
 page and the workspace are not registered on the site yet.
 
@@ -81,6 +83,7 @@ curl -X POST https://control.example.com/api/method/saas_bridge.api.create_site 
 | `email` | no | Login to create as System Manager on the new site. |
 | `password` | no | Password for that login. Generated and returned if omitted. |
 | `first_name`, `last_name` | no | Name for that login. Defaults to the local part of the email. |
+| `max_users` | no | Seat limit, written to the new site's config once it is built. See `set_site_limits`. |
 
 The request is validated synchronously and the install is enqueued, since `bench new-site`
 with a few apps runs well past the HTTP timeout:
@@ -104,6 +107,45 @@ every later attempt at that name. The failure path therefore moves it into
 the same name can simply be retried. Only a directory this run created is ever touched.
 On a containerised bench, note that `archived/` is usually not on the shared sites volume,
 so those archives live inside the container that did the work.
+
+**`POST /api/method/saas_bridge.api.set_site_limits`**
+
+Sets the number of users a site may have.
+
+```bash
+curl -X POST https://control.example.com/api/method/saas_bridge.api.set_site_limits \
+	-H "Authorization: token API_KEY:API_SECRET" \
+	-H "Content-Type: application/json" \
+	-d '{"site": "client1.example.com", "max_users": 10}'
+```
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `site` | yes | The site to limit. |
+| `max_users` | yes | Enabled system users the site may have, `Administrator` included. |
+
+The value is written into the site's own `site_config.json` as
+`saas_bridge_max_users`. Enforcement is not here — it lives in
+[habibi_core](https://github.com/DHI-Partners/habibi-core), which hooks `User.validate` on
+the site and refuses a save that would take it past the limit.
+
+That split is deliberate. The limit has to be written where the limited party cannot reach
+it: a tenant's System Manager can edit any document in their own database, and the
+permissions on it, but not a file on the bench. And the site is given a number rather than
+a plan, so wherever plans end up being kept — here, or a billing service later — nothing
+on the site has to change.
+
+`create_site` takes the same `max_users`, applying it once the site and its first login
+exist: a limit of one user would otherwise have the new site refuse the very login the
+provisioning job is adding. `max_users` below 1 is refused — a site always holds
+`Administrator`, so such a limit could never be satisfied.
+
+The response reports `enforced`, and the Sites table marks a site `limit not enforced`,
+when the target site has no `habibi_core` on it: the key is written, nothing reads it, and
+the limit is decoration. Setting a limit also clears the target site's cache. Frappe keeps
+each site's resolved hooks in redis, so a site that cached them before `habibi_core` was
+deployed goes on accepting users past its limit with nothing to show for it — which is the
+one failure here that looks exactly like success.
 
 **`POST /api/method/saas_bridge.api.set_site_language`**
 
@@ -146,6 +188,7 @@ table on the desk page shows:
 ```json
 {"message": [{"site": "client1.example.com", "db_name": "_946076741d067568",
 	"apps": ["frappe", "erpnext"], "created": "2026-08-13 17:51:47.395286",
+	"max_users": 10,
 	"users": 3, "website_users": 140, "disabled_users": 1,
 	"user_list": [{"name": "owner@client1.com", "full_name": "Owner", "last_active": "..."}],
 	"default_language": "ru", "enabled_languages": ["en", "ru"],

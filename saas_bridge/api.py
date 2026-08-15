@@ -14,6 +14,7 @@ def create_site(
 	password=None,
 	first_name=None,
 	last_name=None,
+	max_users=None,
 ):
 	"""Create a new site with the requested apps and a login for it.
 
@@ -29,6 +30,7 @@ def create_site(
 
 	site = provision.ensure_site_available(provision.normalize_site_name(site))
 	apps = provision.validate_apps(apps)
+	limits = provision.validate_limits(max_users)
 
 	# fail here rather than in the worker, where a config gap only surfaces on polling
 	provision.bench_command()
@@ -86,6 +88,7 @@ def create_site(
 		password=password,
 		first_name=first_name,
 		last_name=last_name,
+		limits=limits,
 	)
 
 	if job is None:
@@ -97,6 +100,7 @@ def create_site(
 		"login": email,
 		"status": "queued",
 		"job_id": job.id,
+		**limits,
 		**generated,
 	}
 
@@ -111,6 +115,38 @@ def get_site_status(site=None):
 	if not state:
 		frappe.throw(f"No provisioning run recorded for {site}")
 	return state
+
+
+@frappe.whitelist(methods=["POST"])
+def set_site_limits(site=None, max_users=None):
+	"""Set the number of users a site may have.
+
+	The value goes into the site's own `site_config.json`, where `habibi_core.limits`
+	reads it: the site refuses a save that would take it past `max_users`. Enforcement
+	lives on the site because that is where users are created; the number lives in the
+	config because that is the one place the tenant cannot edit.
+
+	A site with no limit set is unlimited, and `max_users: 0` is refused rather than
+	treated as "none" — clearing a limit is not something to do by typo.
+	"""
+	frappe.only_for("System Manager")
+
+	site = provision.ensure_site_exists(provision.normalize_site_name(site))
+	values = provision.validate_limits(max_users)
+	if not values:
+		frappe.throw("`max_users` is required")
+
+	provision.bench_command()
+
+	try:
+		provision.set_site_config_values(site, values)
+		# without this a site that cached its hooks before the enforcing app was deployed
+		# accepts the limit and goes on ignoring it, with nothing to show for it
+		provision.clear_site_cache(site)
+	except provision.ProvisionError as exc:
+		frappe.throw(f"Could not set limits on {site}: {exc}")
+
+	return {"site": site, **values, "enforced": provision.LIMIT_ENFORCED_BY in provision.site_apps(site)}
 
 
 @frappe.whitelist(methods=["POST"])

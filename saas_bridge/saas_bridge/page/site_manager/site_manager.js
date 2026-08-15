@@ -35,6 +35,7 @@ saas_bridge.SiteManager = class SiteManager {
 
 		this.render_sites_section();
 		this.render_create_section();
+		this.render_limits_section();
 		this.render_language_section();
 	}
 
@@ -118,10 +119,15 @@ saas_bridge.SiteManager = class SiteManager {
 			$(e.currentTarget).next(".site-detail").toggleClass("hide");
 		});
 
+		// one button for both forms below: picking a site to work on is the same intent
+		// whichever of the two you then press
 		this.$sites_table.find(".site-pick").on("click", (e) => {
 			e.stopPropagation();
 			const site = $(e.currentTarget).attr("data-site");
+			const info = this.sites_info.find((row) => row.site === site) || {};
 			this.language_form.set_value("site", site);
+			this.limits_form.set_value("site", site);
+			this.limits_form.set_value("max_users", info.max_users || 0);
 			frappe.show_alert({ message: __("{0} picked below", [site]), indicator: "blue" });
 		});
 	}
@@ -137,6 +143,8 @@ saas_bridge.SiteManager = class SiteManager {
 		if (info.last_run && info.last_run.status !== "success") {
 			flags += pill(info.last_run.status === "failed" ? "red" : "blue", info.last_run.status);
 		}
+		// a limit nothing on the site reads is the one failure here that looks like success
+		if (info.max_users && info.limit_enforced === false) flags += pill("red", __("limit not enforced"));
 		if (info.site === frappe.boot.sitename) flags += pill("gray", __("this site"));
 
 		const languages = (info.enabled_languages || []).length;
@@ -147,16 +155,11 @@ saas_bridge.SiteManager = class SiteManager {
 			<tr class="site-row" style="cursor: pointer;">
 				<td><b>${esc(info.site)}</b> ${flags}</td>
 				<td class="text-right">${(info.apps || []).length || "—"}</td>
-				<td class="text-right">${
-					info.users === undefined
-						? "—"
-						: info.users +
-							(info.website_users ? ` <span class="text-muted">+${info.website_users} ${__("web")}</span>` : "")
-				}</td>
+				<td class="text-right">${this.seats(info)}</td>
 				<td>${esc(info.default_language || "—")}${languages ? ` <span class="text-muted">(${languages} ${__("enabled")})</span>` : ""}</td>
 				<td class="text-muted">${info.created ? frappe.datetime.comment_when(info.created) : "—"}</td>
 				<td class="text-right">
-					<button class="btn btn-xs btn-default site-pick" data-site="${esc(info.site)}">${__("Set language")}</button>
+					<button class="btn btn-xs btn-default site-pick" data-site="${esc(info.site)}">${__("Pick")}</button>
 				</td>
 			</tr>
 			<tr class="site-detail hide">
@@ -171,6 +174,21 @@ saas_bridge.SiteManager = class SiteManager {
 				</td>
 			</tr>
 		`;
+	}
+
+	seats(info) {
+		if (info.users === undefined) return info.max_users ? `— / ${info.max_users}` : "—";
+
+		// the limit is the number the site itself refuses its next user by, so a site that
+		// has reached it is worth seeing at a glance rather than in the detail
+		const used = info.max_users
+			? `<span class="${info.users >= info.max_users ? "text-danger" : ""}">${info.users} / ${info.max_users}</span>`
+			: `${info.users}`;
+		const web = info.website_users
+			? ` <span class="text-muted">+${info.website_users} ${__("web")}</span>`
+			: "";
+
+		return used + web;
 	}
 
 	user_detail(info) {
@@ -249,6 +267,12 @@ saas_bridge.SiteManager = class SiteManager {
 				},
 				{ fieldname: "first_name", fieldtype: "Data", label: __("First name") },
 				{ fieldname: "last_name", fieldtype: "Data", label: __("Last name") },
+				{
+					fieldname: "max_users",
+					fieldtype: "Int",
+					label: __("User limit"),
+					description: __("Left at 0 the site is unlimited"),
+				},
 			],
 		});
 		this.create_form.make();
@@ -258,6 +282,42 @@ saas_bridge.SiteManager = class SiteManager {
 			.on("click", () => this.create_site());
 
 		this.$create_result = areas.result;
+	}
+
+	render_limits_section() {
+		const areas = this.card(
+			__("User limit"),
+			__(
+				"Writes the seat limit into the site's own config, where habibi_core enforces it: the site refuses a user that would take it past the limit."
+			)
+		);
+
+		this.limits_form = new frappe.ui.FieldGroup({
+			body: areas.form[0],
+			fields: [
+				{
+					fieldname: "site",
+					fieldtype: "Autocomplete",
+					label: __("Site"),
+					reqd: 1,
+					options: this.sites,
+				},
+				{ fieldtype: "Column Break" },
+				{
+					fieldname: "max_users",
+					fieldtype: "Int",
+					label: __("User limit"),
+					description: __("Enabled system users the site may have, Administrator included"),
+				},
+			],
+		});
+		this.limits_form.make();
+
+		this.$limits_button = $(`<button class="btn btn-primary btn-sm">${__("Apply")}</button>`)
+			.appendTo(areas.action)
+			.on("click", () => this.set_limits());
+
+		this.$limits_result = areas.result;
 	}
 
 	render_language_section() {
@@ -334,6 +394,45 @@ saas_bridge.SiteManager = class SiteManager {
 		this.create_form.set_value("password", "");
 		this.render_generated_passwords(result);
 		this.start_polling(result.site);
+	}
+
+	async set_limits() {
+		const values = this.limits_form.get_values();
+		if (!values) return;
+
+		// zero is not "no limit" on the API side either: clearing a limit should be a
+		// deliberate act, not a field left empty
+		const args = { site: values.site, max_users: cint(values.max_users) };
+		if (!args.max_users) {
+			frappe.msgprint(__("Set a user limit of at least one"));
+			return;
+		}
+
+		this.$limits_button.prop("disabled", true);
+		let response;
+		try {
+			response = await frappe.call({ method: "saas_bridge.api.set_site_limits", args });
+		} catch (e) {
+			return;
+		} finally {
+			this.$limits_button.prop("disabled", false);
+		}
+
+		const result = response && response.message;
+		if (!result) return;
+
+		const message = result.enforced
+			? __("{0} is limited to {1} users", [result.site, result.saas_bridge_max_users])
+			: __("{0} is limited to {1} users, but nothing on that site enforces it — habibi_core is not installed there", [
+					result.site,
+					result.saas_bridge_max_users,
+				]);
+		frappe.show_alert({ message: message, indicator: result.enforced ? "green" : "orange" });
+		this.$limits_result.html(
+			`<div class="mt-3 ${result.enforced ? "text-muted" : "text-danger"}">${frappe.utils.escape_html(message)}</div>`
+		);
+
+		this.load_sites();
 	}
 
 	async set_language() {
