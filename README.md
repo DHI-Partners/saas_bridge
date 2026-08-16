@@ -59,6 +59,53 @@ through to `bench new-site` — a docker bench needs
 `saas_bridge_bench_command` is only needed when `bench` is neither in the bench's own venv
 nor on the worker's `PATH`.
 
+#### Setting it up on a docker bench
+
+`bench` lives inside the backend container, not on the host, so the two keys are set
+through it. Substitute the compose service name if yours is not `backend`:
+
+```bash
+docker compose exec backend bench --site <control-site> \
+	set-config saas_bridge_db_root_password '<mariadb root password>'
+
+docker compose exec backend bench --site <control-site> \
+	set-config saas_bridge_new_site_extra_args '["--mariadb-user-host-login-scope=%"]' --parse
+
+docker compose exec backend bench --site <control-site> \
+	execute "frappe.conf.get('saas_bridge_new_site_extra_args')"
+```
+
+The last line is the check: it must print the list back. Both keys belong to the
+**controlling** site — that is the config `create_site` reads. No restart is needed, the
+config is read per request. `--parse` is what stores a list as a list rather than as a
+string, and the same flag is what stores `max_users` as a number.
+
+Set both **before** creating any site. `saas_bridge_new_site_extra_args` only affects the
+moment of creation and does not retrofit sites that already exist. Two failures follow from
+skipping them, and they look nothing alike:
+
+| What you see | What it means |
+| --- | --- |
+| `Database root password missing — set saas_bridge_db_root_password in site config` on **Create site** | the first key is not set. Nothing was created; the check runs before the job is queued. |
+| The run reports `success`, but the site shows up `unreachable` with `(1045, "Access denied for user '_xxx'@'172.18.0.7'")` — and answers HTTP with a 500 | created without `--mariadb-user-host-login-scope=%`. Its database user is bound to a single host and the backend is not it. |
+
+The second one has to be fixed per site: set the key, then drop and recreate the site, or
+grant the existing user access from any host. Note that binding the user to the backend's
+current address instead of `%` is not a fix — container addresses change on the next
+`docker compose up`, and the site breaks again.
+
+```bash
+docker compose exec backend bash -lc \
+	'bench drop-site <site> \
+		--db-root-password "$(bench --site <control-site> execute "frappe.conf.saas_bridge_db_root_password")" \
+		--force --no-backup'
+```
+
+That reads the password from the config inside the container, so it reaches neither the
+terminal nor the shell history. `drop-site` drops the database and moves the site directory
+to `archived/sites` rather than deleting it, which on a containerised bench means inside
+the container that ran it.
+
 **`POST /api/method/saas_bridge.api.create_site`**
 
 ```bash
@@ -208,8 +255,11 @@ A site that cannot be read keeps its row, with the reason in `error` and the dat
 fields missing. `last_run` carries the `get_site_status` state when the site was
 provisioned through this app within the last 24 hours.
 
-Note that the new site still needs to be routable — run `bench setup nginx` and point DNS
-at the host, or the site will only answer on the bench's own port.
+Note that the new site still needs to be routable. On a containerised bench the frontend
+routes by the `Host` header, so a new tenant needs DNS pointing at the host — a wildcard
+record on the provisioning domain, with a certificate to match — and nothing further from
+this app. On a plain bench, run `bench setup nginx` and point DNS at the host, or the site
+will only answer on the bench's own port.
 
 ### Contributing
 
