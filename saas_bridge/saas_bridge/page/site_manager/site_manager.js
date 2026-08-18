@@ -35,6 +35,7 @@ saas_bridge.SiteManager = class SiteManager {
 
 		this.render_sites_section();
 		this.render_create_section();
+		this.render_apps_section();
 		this.render_limits_section();
 		this.render_language_section();
 	}
@@ -51,13 +52,27 @@ saas_bridge.SiteManager = class SiteManager {
 		this.sites_info = (r && r.message) || [];
 		this.sites = this.sites_info.map((info) => info.site);
 
-		// both are built once, so a site added later has to be pushed into them by hand
-		const field = this.language_form && this.language_form.get_field("site");
-		if (field) {
+		// the forms are built once, so a site added later has to be pushed into them by hand
+		for (const form of [this.language_form, this.limits_form, this.apps_form]) {
+			const field = form && form.get_field("site");
+			if (!field) continue;
 			field.df.options = this.sites;
 			field.set_data && field.set_data(this.sites);
 		}
+
 		if (this.$sites_table) this.render_sites_table();
+		// the app pickers are filled from this list, so a change made elsewhere has to reach
+		// them too — otherwise they go on offering an app the site already has
+		if (this.apps_form) this.refresh_app_fields();
+	}
+
+	site_info(site) {
+		return this.sites_info.find((row) => row.site === site) || {};
+	}
+
+	// frappe is installed on every site and cannot be removed from any of them
+	installed_apps(site) {
+		return (this.site_info(site).apps || []).filter((app) => app !== "frappe");
 	}
 
 	// --- layout -------------------------------------------------------------
@@ -119,15 +134,16 @@ saas_bridge.SiteManager = class SiteManager {
 			$(e.currentTarget).next(".site-detail").toggleClass("hide");
 		});
 
-		// one button for both forms below: picking a site to work on is the same intent
-		// whichever of the two you then press
+		// one button for every form below: picking a site to work on is the same intent
+		// whichever of them you then press
 		this.$sites_table.find(".site-pick").on("click", (e) => {
 			e.stopPropagation();
 			const site = $(e.currentTarget).attr("data-site");
-			const info = this.sites_info.find((row) => row.site === site) || {};
+			const info = this.site_info(site);
 			this.language_form.set_value("site", site);
 			this.limits_form.set_value("site", site);
 			this.limits_form.set_value("max_users", info.max_users || 0);
+			this.apps_form.set_value("site", site);
 			frappe.show_alert({ message: __("{0} picked below", [site]), indicator: "blue" });
 		});
 	}
@@ -142,6 +158,11 @@ saas_bridge.SiteManager = class SiteManager {
 		if (info.scheduler_paused) flags += pill("gray", __("scheduler paused"));
 		if (info.last_run && info.last_run.status !== "success") {
 			flags += pill(info.last_run.status === "failed" ? "red" : "blue", info.last_run.status);
+		}
+		// an app change in flight is worth seeing on the row: the app list next to it is the
+		// one from before the change and is about to be wrong
+		if (info.last_apps_run && ["queued", "running"].includes(info.last_apps_run.status)) {
+			flags += pill("blue", __("apps {0}", [info.last_apps_run.status]));
 		}
 		// a limit nothing on the site reads is the one failure here that looks like success
 		if (info.max_users && info.limit_enforced === false) flags += pill("red", __("limit not enforced"));
@@ -170,10 +191,21 @@ saas_bridge.SiteManager = class SiteManager {
 					${detail(__("Database"), info.db_name)}
 					${detail(__("Created"), info.created)}
 					${info.last_run ? detail(__("Last provisioning run"), `${info.last_run.status}${info.last_run.error ? " — " + info.last_run.error : ""}`) : ""}
+					${info.last_apps_run ? detail(__("Last app change"), this.apps_run_summary(info.last_apps_run)) : ""}
 					${info.error ? `<div class="text-danger">${esc(info.error)}</div>` : ""}
 				</td>
 			</tr>
 		`;
+	}
+
+	apps_run_summary(run) {
+		// what was asked for, not what was done: a failed run is the one worth reading, and
+		// there the two differ
+		const parts = [run.status];
+		if ((run.uninstall || []).length) parts.push(`−${run.uninstall.join(", ")}`);
+		if ((run.install || []).length) parts.push(`+${run.install.join(", ")}`);
+		if (run.error) parts.push(`— ${run.error}`);
+		return parts.join(" ");
 	}
 
 	seats(info) {
@@ -282,6 +314,114 @@ saas_bridge.SiteManager = class SiteManager {
 			.on("click", () => this.create_site());
 
 		this.$create_result = areas.result;
+	}
+
+	render_apps_section() {
+		const areas = this.card(
+			__("Site apps"),
+			__(
+				"Installs and uninstalls apps on a site that already exists. Removals run first, then installs, in the background. Uninstalling deletes that app's doctypes and their data from the site, and an app that requires another brings it along."
+			)
+		);
+
+		this.apps_form = new frappe.ui.FieldGroup({
+			body: areas.form[0],
+			fields: [
+				{
+					fieldname: "site",
+					fieldtype: "Autocomplete",
+					label: __("Site"),
+					reqd: 1,
+					options: this.sites,
+					onchange: () => this.refresh_app_fields(),
+				},
+				{
+					fieldname: "install",
+					fieldtype: "MultiSelectPills",
+					label: __("Install"),
+					get_data: (txt) => this.app_options("install", txt),
+				},
+				{ fieldtype: "Column Break" },
+				{
+					fieldname: "uninstall",
+					fieldtype: "MultiSelectPills",
+					label: __("Uninstall"),
+					get_data: (txt) => this.app_options("uninstall", txt),
+					description: __("Only apps the picked site has — frappe is never one of them"),
+				},
+				{
+					fieldname: "backup",
+					fieldtype: "Check",
+					label: __("Back up before uninstalling"),
+					default: 1,
+					description: __("The only way back from a removal that took data with it"),
+				},
+			],
+		});
+		this.apps_form.make();
+		this.apps_form.set_value("backup", 1);
+
+		this.$apps_button = $(`<button class="btn btn-primary btn-sm">${__("Apply changes")}</button>`)
+			.appendTo(areas.action)
+			.on("click", () => this.set_apps());
+
+		this.$apps_result = areas.result;
+		this.$apps_installed = $(`<div class="text-muted mt-2"></div>`).insertBefore(this.$apps_result);
+		this.refresh_app_fields();
+	}
+
+	// the pickers are filled from the site list the page already has, so switching site costs
+	// nothing — the list is refreshed after every change that could make it stale
+	app_options(direction, txt) {
+		const site = this.apps_form && this.apps_form.get_value("site");
+		if (!site) return [];
+
+		// the desk you are reading this on runs on its own site, and the server refuses to
+		// uninstall from it — offering the apps here would only lead to that error
+		if (direction === "uninstall" && site === frappe.boot.sitename) return [];
+
+		const installed = this.installed_apps(site);
+		const options =
+			direction === "uninstall"
+				? installed
+				: this.available_apps.filter((app) => !installed.includes(app));
+
+		return options.filter((app) => !txt || app.includes(txt.toLowerCase()));
+	}
+
+	refresh_app_fields() {
+		const site = this.apps_form.get_value("site");
+
+		// a selection carried over from the previous site would be sent against this one:
+		// half of it not installed here, the other half installed already
+		this.apps_form.set_value("install", []);
+		this.apps_form.set_value("uninstall", []);
+
+		const info = this.site_info(site);
+		if (!site) {
+			this.$apps_installed.text(__("Pick a site to see what it has installed."));
+			return;
+		}
+		if (info.error) {
+			this.$apps_installed.html(
+				`<span class="text-danger">${__("{0} could not be read: {1}", [
+					frappe.utils.escape_html(site),
+					frappe.utils.escape_html(info.error),
+				])}</span>`
+			);
+			return;
+		}
+
+		const own_site =
+			site === frappe.boot.sitename
+				? ` <span class="text-danger">${__("Apps can only be added here — this is the site serving this desk.")}</span>`
+				: "";
+
+		this.$apps_installed.html(
+			frappe.utils.escape_html(
+				__("Installed on {0}: {1}", [site, (info.apps || []).join(", ") || __("nothing yet")])
+			) + own_site
+		);
 	}
 
 	render_limits_section() {
@@ -396,6 +536,58 @@ saas_bridge.SiteManager = class SiteManager {
 		this.start_polling(result.site);
 	}
 
+	async set_apps() {
+		const values = this.apps_form.get_values();
+		if (!values) return;
+
+		const install = values.install || [];
+		const uninstall = values.uninstall || [];
+		if (!install.length && !uninstall.length) {
+			frappe.msgprint(__("Pick at least one app to install or uninstall"));
+			return;
+		}
+
+		// an uninstall takes the app's data with it and there is no undo short of the backup,
+		// so the removals are spelled out and confirmed before anything is enqueued
+		if (uninstall.length) {
+			const confirmed = await new Promise((resolve) => {
+				frappe.confirm(
+					__("Uninstall {0} from {1}? Their doctypes and all data in them are deleted.", [
+						uninstall.join(", "),
+						values.site,
+					]) + (values.backup ? "" : `<br><b>${__("No backup will be taken.")}</b>`),
+					() => resolve(true),
+					() => resolve(false)
+				);
+			});
+			if (!confirmed) return;
+		}
+
+		this.$apps_button.prop("disabled", true);
+		let response;
+		try {
+			response = await frappe.call({
+				method: "saas_bridge.api.set_site_apps",
+				args: {
+					site: values.site,
+					install: install,
+					uninstall: uninstall,
+					backup: cint(values.backup),
+				},
+			});
+		} catch (e) {
+			return;
+		} finally {
+			this.$apps_button.prop("disabled", false);
+		}
+
+		const result = response && response.message;
+		if (!result) return;
+
+		this.$apps_result.empty();
+		this.start_polling(result.site, "saas_bridge.api.get_site_apps_status", this.$apps_result);
+	}
+
 	async set_limits() {
 		const values = this.limits_form.get_values();
 		if (!values) return;
@@ -501,11 +693,14 @@ saas_bridge.SiteManager = class SiteManager {
 		`);
 	}
 
-	start_polling(site) {
+	// one poller for both kinds of run: they are the same loop over two run states, and only
+	// one of them can be watched at a time anyway
+	start_polling(site, method, $container) {
 		this.stop_polling();
 		this.polled_site = site;
+		this.poll_method = method || "saas_bridge.api.get_site_status";
 
-		this.$status = $(`<div class="mt-4"></div>`).appendTo(this.$create_result);
+		this.$status = $(`<div class="mt-4"></div>`).appendTo($container || this.$create_result);
 		this.tick();
 	}
 
@@ -532,7 +727,7 @@ saas_bridge.SiteManager = class SiteManager {
 		let response;
 		try {
 			response = await frappe.call({
-				method: "saas_bridge.api.get_site_status",
+				method: this.poll_method,
 				args: { site: site },
 				no_spinner: true,
 			});
@@ -559,17 +754,29 @@ saas_bridge.SiteManager = class SiteManager {
 			return;
 		}
 
+		const apps_run = this.poll_method.endsWith("get_site_apps_status");
 		this.polled_site = null;
 
-		// a finished run is the moment the site becomes something the language form can act
-		// on, so pull it into that field without waiting for a manual refresh
-		if (state.status === "success") this.load_sites();
+		// a finished creation is the moment the site becomes something the other forms can act
+		// on; a finished app change moved apps around even when it failed halfway, and the
+		// pickers are filled from that list — either way, refresh rather than wait to be asked
+		if (apps_run || state.status === "success") this.load_sites();
 
-		frappe.show_alert({
-			message:
+		let message;
+		if (apps_run) {
+			message =
+				state.status === "success"
+					? __("Apps on {0} are up to date", [state.site])
+					: __("Changing apps on {0} failed", [state.site]);
+		} else {
+			message =
 				state.status === "success"
 					? __("{0} is ready", [state.site])
-					: __("Creating {0} failed", [state.site]),
+					: __("Creating {0} failed", [state.site]);
+		}
+
+		frappe.show_alert({
+			message: message,
 			indicator: state.status === "success" ? "green" : "red",
 		});
 	}
@@ -590,6 +797,7 @@ saas_bridge.SiteManager = class SiteManager {
 				</span>
 			</div>
 			${line(__("Apps installed"), (state.apps_installed || []).join(", "))}
+			${line(__("Apps removed"), (state.apps_removed || []).join(", "))}
 			${line(__("Login created"), state.login_created)}
 			${line(__("Cleanup"), state.cleanup)}
 			${state.error ? `<div class="mt-2"><pre class="small">${frappe.utils.escape_html(state.error)}</pre></div>` : ""}

@@ -118,6 +118,124 @@ def get_site_status(site=None):
 
 
 @frappe.whitelist(methods=["POST"])
+def set_site_apps(site=None, install=None, uninstall=None, backup=1):
+	"""Add and remove apps on a site that already exists.
+
+	One endpoint for both directions because they are one intent: a plan change is usually a
+	swap, and doing it in a single run means the two halves cannot interleave with another
+	request's. Removals run first — see `provision.change_site_apps`.
+
+	Validated synchronously against the site's own list of installed apps, then enqueued:
+	installing an app migrates the whole site, which runs for minutes. Poll
+	`get_site_apps_status` for the outcome.
+
+	Uninstalling drops the app's doctypes and their data from the site, and takes a backup
+	first unless `backup` is false.
+
+	An app that declares `required_apps` brings them with it: bench installs those first, so
+	a site can end up with more apps than were asked for. The finished run reports what was
+	requested — read the site's app list back for what it actually has.
+	"""
+	frappe.only_for("System Manager")
+
+	site = provision.ensure_site_exists(provision.normalize_site_name(site))
+
+	# the site serving this request is the one running this code: uninstalling an app from
+	# it would pull the desk apart under the caller, and the worker doing it holds this same
+	# site's connection. Bench changes to this site belong on the command line
+	if site == frappe.local.site and uninstall:
+		frappe.throw(f"{site} is the site serving this request — uninstall apps from it with bench")
+
+	install, uninstall = provision.validate_app_changes(site, install, uninstall)
+	backup = 1 if cint(backup) else 0
+
+	# fail here rather than in the worker, where a config gap only surfaces on polling
+	provision.bench_command()
+
+	# a site being built has no settled app list to change, and the two jobs would be
+	# running `bench` against the same site at the same time
+	provisioning = provision.get_state(site)
+	if provisioning and provisioning.get("status") in ("queued", "running"):
+		frappe.throw(f"{site} is still being provisioned")
+
+	job_id = f"saas-bridge-apps-{site}"
+	state = provision.get_state(site, kind=provision.APPS_STATE)
+	if (state and state.get("status") in ("queued", "running")) or is_job_enqueued(job_id):
+		frappe.throw(f"App changes on {site} are already in progress")
+
+	provision.set_state(
+		site,
+		kind=provision.APPS_STATE,
+		status="queued",
+		install=install,
+		uninstall=uninstall,
+		backup=backup,
+		queued_at=now(),
+		error=None,
+		apps_installed=None,
+		apps_removed=None,
+		# the previous run's timestamps are still in this key, and a queued run showing when
+		# some earlier one started reads as progress it has not made
+		started_at=None,
+		finished_at=None,
+	)
+
+	job = frappe.enqueue(
+		"saas_bridge.provision.change_site_apps",
+		queue="long",
+		# every app is its own bench step and each may take the full step timeout
+		timeout=(len(install) + len(uninstall)) * provision.step_timeout() + 60,
+		job_id=job_id,
+		deduplicate=True,
+		site=site,
+		install=install,
+		uninstall=uninstall,
+		backup=backup,
+	)
+
+	if job is None:
+		frappe.throw(f"App changes on {site} are already in progress")
+
+	return {
+		"site": site,
+		"install": install,
+		"uninstall": uninstall,
+		"backup": backup,
+		"status": "queued",
+		"job_id": job.id,
+	}
+
+
+@frappe.whitelist()
+def get_site_apps_status(site=None):
+	"""Progress of a `set_site_apps` call: queued, running, success or failed."""
+	frappe.only_for("System Manager")
+
+	site = provision.normalize_site_name(site)
+	state = provision.get_state(site, kind=provision.APPS_STATE)
+	if not state:
+		frappe.throw(f"No app change recorded for {site}")
+	return state
+
+
+@frappe.whitelist()
+def get_site_apps(site=None):
+	"""What is installed on one site, and what else this bench could install on it."""
+	frappe.only_for("System Manager")
+
+	site = provision.ensure_site_exists(provision.normalize_site_name(site))
+	installed = provision.site_apps(site)
+
+	return {
+		"site": site,
+		"installed": installed,
+		"available": [app for app in get_available_apps() if app not in installed],
+		# the caller has to be told the difference between "no apps" and "could not look"
+		"error": None if installed else f"Could not read the apps installed on {site}",
+	}
+
+
+@frappe.whitelist(methods=["POST"])
 def set_site_limits(site=None, max_users=None):
 	"""Set the number of users a site may have.
 

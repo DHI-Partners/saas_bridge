@@ -26,6 +26,10 @@ page (`/app/site-manager`) behind it:
 - **Create a site** — name, apps, and an optional System Manager login. Passwords left
   empty are generated and shown once, and the run's progress is polled below the form
   until it succeeds or fails.
+- **Site apps** — adds and removes apps on a site that already exists. The pickers only
+  offer what the picked site can take: apps it does not have on the install side, apps it
+  does have on the uninstall side. Removals are confirmed by name before anything runs, and
+  the run's progress is polled below the form.
 - **User limit** — writes the seat limit into a site's own config.
 - **Site language** — enables a language on a site that already exists, Russian by
   default.
@@ -155,6 +159,66 @@ the same name can simply be retried. Only a directory this run created is ever t
 On a containerised bench, note that `archived/` is usually not on the shared sites volume,
 so those archives live inside the container that did the work.
 
+**`POST /api/method/saas_bridge.api.set_site_apps`**
+
+Adds and removes apps on a site that already exists.
+
+```bash
+curl -X POST https://control.example.com/api/method/saas_bridge.api.set_site_apps \
+	-H "Authorization: token API_KEY:API_SECRET" \
+	-H "Content-Type: application/json" \
+	-d '{"site": "client1.example.com", "install": ["hrms"], "uninstall": ["habibi_telegram"]}'
+```
+
+```json
+{"message": {"site": "client1.example.com", "install": ["hrms"],
+	"uninstall": ["habibi_telegram"], "backup": 1, "status": "queued", "job_id": "..."}}
+```
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `site` | yes | The site to change. Must already exist. |
+| `install` | no | Apps to install. Same list and same `saas_bridge_allowed_apps` filter as `create_site`. |
+| `uninstall` | no | Apps to remove, with their doctypes and every document in them. |
+| `backup` | no | `1` (default) backs the site up before the first removal, `0` skips it. |
+
+One endpoint for both directions because they are one intent — a plan change is usually a
+swap — and doing it in a single run means the two halves cannot interleave with another
+request's. Removals run first, so swapping one app for another that conflicts with it works
+in a single call. At least one of the two lists has to be non-empty.
+
+Both lists are checked against the site's own installed apps before either runs: an install
+of an app the site already has, or a removal of one it does not, is refused outright rather
+than half-applied. `frappe` cannot be uninstalled — drop the site instead — and neither can
+anything be removed from the site serving the request, which would pull the desk apart
+under the caller. An app that declares `required_apps` brings them with it, so a site can
+end up with more apps than were asked for.
+
+Like `create_site` this is enqueued: installing an app migrates the whole site, well past
+the HTTP timeout. Poll:
+
+**`GET /api/method/saas_bridge.api.get_site_apps_status?site=client1.example.com`**
+
+`queued`, `running`, `success` or `failed`, with `apps_removed` and `apps_installed`
+growing as the run goes and the bench error in `error` if it stops. The two lists are what
+actually happened, `install` and `uninstall` what was asked for — on a failed run they
+differ, and the difference is what is left to redo. Kept for 24 hours, separately from the
+provisioning state, so an app change never overwrites the record of how the site was made.
+
+Every step is verified against the site's own app list afterwards, because bench does not
+fail loudly here: `uninstall-app` prints `App X is a dependency of Y. Uninstall Y first.`
+and exits **zero** without removing anything, and `install-app` does the same for an app
+that is already there. Taking the exit code at its word would report those as done.
+
+**`GET /api/method/saas_bridge.api.get_site_apps?site=client1.example.com`**
+
+What one site has installed and what else this bench could install on it:
+
+```json
+{"message": {"site": "client1.example.com", "installed": ["frappe", "erpnext"],
+	"available": ["hrms"], "error": null}}
+```
+
 **`POST /api/method/saas_bridge.api.set_site_limits`**
 
 Sets the number of users a site may have.
@@ -253,7 +317,13 @@ read-only and separate from the request's own — every write still goes through
 
 A site that cannot be read keeps its row, with the reason in `error` and the database
 fields missing. `last_run` carries the `get_site_status` state when the site was
-provisioned through this app within the last 24 hours.
+provisioned through this app within the last 24 hours, and `last_apps_run` the
+`get_site_apps_status` state when its apps were changed through it.
+
+`apps` is read from the site's `installed_apps` global — the same list `frappe.get_installed_apps`
+returns, and the one that decides which hooks resolve — rather than from the
+`Installed Application` table beside it. The two can drift, and it is the global that bench
+acts on.
 
 Note that the new site still needs to be routable. On a containerised bench the frontend
 routes by the `Host` header, so a new tenant needs DNS pointing at the host — a wildcard

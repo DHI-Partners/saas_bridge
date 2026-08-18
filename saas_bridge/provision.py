@@ -30,6 +30,10 @@ MAX_USERS_KEY = "saas_bridge_max_users"
 # the app that enforces the limit on the site itself. A site without it takes the config
 # key and ignores it, which is worth saying out loud rather than leaving to be discovered
 LIMIT_ENFORCED_BY = "habibi_core"
+# the two kinds of run this app keeps state for, kept apart so an app change does not
+# overwrite the record of how the site was created
+PROVISION_STATE = "provision"
+APPS_STATE = "apps"
 DEFAULT_TIMEOUT = 30 * 60
 DEFAULT_COMMAND_TIMEOUT = 5 * 60
 STATE_TTL = 24 * 60 * 60
@@ -147,6 +151,45 @@ def validate_apps(apps):
 	return validated
 
 
+def validate_app_changes(site, install=None, uninstall=None):
+	"""Check a set of app changes against what the site actually has installed.
+
+	Both lists are checked before either runs, so a request that asks for one impossible
+	change makes none of them rather than half of them.
+
+	The allowed-apps list is only applied to installs: an app that was once allowed and no
+	longer is still has to be removable, and removing it is how a site gets back into line.
+
+	Nothing here has to rule out an app appearing in both lists — one requires it to be
+	absent from the site, the other requires it to be there.
+	"""
+	installed = site_apps(site)
+	# every site has frappe installed, so an empty list is never a site without apps — it is
+	# `site_apps` swallowing the error from a database it could not read
+	if not installed:
+		frappe.throw(f"Could not read the apps installed on {site} — is its database reachable?")
+
+	install = validate_apps(install)
+
+	validated_uninstall = []
+	for app in as_list(uninstall):
+		if app == "frappe":
+			frappe.throw("`frappe` cannot be uninstalled — drop the site instead")
+		if app not in installed:
+			frappe.throw(f"App {app!r} is not installed on {site}")
+		if app not in validated_uninstall:
+			validated_uninstall.append(app)
+
+	already = [app for app in install if app in installed]
+	if already:
+		frappe.throw(f"Already installed on {site}: {', '.join(already)}")
+
+	if not install and not validated_uninstall:
+		frappe.throw("Nothing to do — pass `install`, `uninstall` or both")
+
+	return install, validated_uninstall
+
+
 def validate_limits(max_users=None):
 	"""Check the limit keys before they are written into a site's config.
 
@@ -174,19 +217,19 @@ def validate_password(password, label):
 # --- run state -------------------------------------------------------------
 
 
-def state_key(site):
-	return f"saas_bridge:provision:{site}"
+def state_key(site, kind=PROVISION_STATE):
+	return f"saas_bridge:{kind}:{site}"
 
 
-def get_state(site):
+def get_state(site, kind=PROVISION_STATE):
 	# expires=True: the key has a TTL, so it must not be held in frappe.local
-	return frappe.cache.get_value(state_key(site), expires=True)
+	return frappe.cache.get_value(state_key(site, kind), expires=True)
 
 
-def set_state(site, **changes):
-	state = get_state(site) or {"site": site}
+def set_state(site, kind=PROVISION_STATE, **changes):
+	state = get_state(site, kind) or {"site": site}
 	state.update(changes)
-	frappe.cache.set_value(state_key(site), state, expires_in_sec=STATE_TTL)
+	frappe.cache.set_value(state_key(site, kind), state, expires_in_sec=STATE_TTL)
 	return state
 
 
@@ -254,12 +297,27 @@ def clear_site_cache(site):
 	)
 
 
+def read_installed_apps(db):
+	"""The apps a site actually runs, read from the same place frappe reads them.
+
+	`frappe.get_installed_apps` reads this global, and everything that follows from it does
+	too: which hooks resolve, and whether `bench install-app` / `uninstall-app` think there
+	is anything to do. `tabInstalled Application` is a display table kept alongside it, and
+	the two can drift — checking an app change against the table would then report a removal
+	that bench had quietly refused as done.
+	"""
+	row = db.sql(
+		"select defvalue from tabDefaultValue where parent = '__global' and defkey = 'installed_apps'"
+	)
+	return frappe.parse_json(row[0][0]) if row and row[0][0] else []
+
+
 def read_site_details(conf):
 	"""What a site's own database says about it."""
 	db = site_database(conf)
 	try:
 		return {
-			"apps": [row[0] for row in db.sql("select app_name from `tabInstalled Application` order by idx")],
+			"apps": read_installed_apps(db),
 			# Administrator counts: it is the login the site was created with, and leaving it
 			# out reports a brand new site as having no users at all. Guest never does — it
 			# is a fixture, not an account anyone holds
@@ -305,7 +363,7 @@ def site_apps(site):
 		return []
 
 	try:
-		return [row[0] for row in db.sql("select app_name from `tabInstalled Application`")]
+		return read_installed_apps(db)
 	finally:
 		db.close()
 
@@ -325,6 +383,7 @@ def describe_site(site):
 		# the limit this app writes and habibi_core enforces on the site itself
 		"max_users": cint(conf.get(MAX_USERS_KEY)) or None,
 		"last_run": get_state(site),
+		"last_apps_run": get_state(site, kind=APPS_STATE),
 		"error": None,
 	}
 
@@ -590,3 +649,83 @@ def provision_site(
 		raise
 
 	return set_state(site, status="success", finished_at=now())
+
+
+def change_site_apps(site, install=None, uninstall=None, backup=1):
+	"""Background job: uninstall apps from an existing site, then install others.
+
+	A job rather than a request for the same reason as `provision_site`: installing an app
+	migrates the whole site and takes minutes. Poll the `apps` run state for the outcome.
+
+	Removals run first, so swapping one app for another that conflicts with it works in a
+	single call.
+
+	Every step is verified against the site's own list of installed apps afterwards. It has
+	to be: `bench uninstall-app` prints "X is a dependency of Y" and exits **zero** without
+	removing anything, and `install-app` does the same for an app that is already there.
+	Trusting the exit code alone would report those as done.
+	"""
+	install = install or []
+	uninstall = uninstall or []
+	timeout = step_timeout()
+	removed = []
+	installed = []
+
+	set_state(
+		site,
+		kind=APPS_STATE,
+		status="running",
+		started_at=now(),
+		error=None,
+		install=install,
+		uninstall=uninstall,
+		apps_installed=[],
+		apps_removed=[],
+		finished_at=None,
+	)
+
+	try:
+		for app in uninstall:
+			args = [bench_command(), "--site", site, "uninstall-app", app, "--yes"]
+			# the backup is the only way back from a removal that took a tenant's data with
+			# it, so it is opt-out rather than opt-in
+			if not cint(backup):
+				args.append("--no-backup")
+
+			output = run(args, f"`bench --site {site} uninstall-app {app}`", [], timeout)
+			if app in site_apps(site):
+				raise ProvisionError(
+					f"{app} is still installed on {site} after uninstall-app — "
+					f"{output.strip()[-500:] or 'bench reported nothing'}"
+				)
+
+			removed.append(app)
+			set_state(site, kind=APPS_STATE, apps_removed=list(removed))
+
+		for app in install:
+			output = run(
+				[bench_command(), "--site", site, "install-app", app],
+				f"`bench --site {site} install-app {app}`",
+				[],
+				timeout,
+			)
+			if app not in site_apps(site):
+				raise ProvisionError(
+					f"{app} is not installed on {site} after install-app — "
+					f"{output.strip()[-500:] or 'bench reported nothing'}"
+				)
+
+			installed.append(app)
+			set_state(site, kind=APPS_STATE, apps_installed=list(installed))
+
+		# the target site keeps its resolved hooks and its app list in redis, and both just
+		# changed — without this it goes on serving the old set until something else clears it
+		clear_site_cache(site)
+
+	except Exception as exc:
+		message = str(exc)
+		set_state(site, kind=APPS_STATE, status="failed", error=message, finished_at=now())
+		frappe.log_error(title=f"SaaS Bridge: changing apps on {site} failed", message=message)
+		raise
+
+	return set_state(site, kind=APPS_STATE, status="success", finished_at=now())
