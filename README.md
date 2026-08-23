@@ -52,6 +52,7 @@ site's `site_config.json` first:
 	"saas_bridge_allowed_apps": ["erpnext", "hrms"],
 	"saas_bridge_new_site_extra_args": ["--mariadb-user-host-login-scope=%"],
 	"saas_bridge_provision_timeout": 1800,
+	"saas_bridge_archived_sites_path": "/home/frappe/frappe-bench/sites/archived",
 	"saas_bridge_bench_command": "/home/frappe/frappe-bench/env/bin/bench"
 }
 ```
@@ -217,6 +218,55 @@ What one site has installed and what else this bench could install on it:
 ```json
 {"message": {"site": "client1.example.com", "installed": ["frappe", "erpnext"],
 	"available": ["hrms"], "error": null}}
+```
+
+**`POST /api/method/saas_bridge.api.drop_site`**
+
+Снимает сайт с бенча.
+
+```bash
+curl -X POST https://control.example.com/api/method/saas_bridge.api.drop_site \
+	-H "Authorization: token API_KEY:API_SECRET" \
+	-H "Content-Type: application/json" \
+	-d '{"site": "client1.example.com"}'
+```
+
+```json
+{"message": {"site": "client1.example.com", "backup": 1, "status": "queued",
+	"job_id": "..."}}
+```
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `site` | yes | The site to remove. Must exist, and must not be the site serving the request. |
+| `backup` | no | `1` (default) backs the site up first, `0` skips it. |
+
+`bench drop-site` drops the database and the database user, and **moves** the site
+directory into `archived/sites` rather than deleting it. The database is not archived with
+it — so the backup taken first is the only thing that can bring the site back, and
+`backup: 0` makes the removal final for everything except the site's files. The backup
+lands in the site's own `private/backups` and travels with the directory, which is what
+makes an archive restorable on its own.
+
+Refused while the site is being provisioned or its apps are being changed: those jobs are
+running `bench` against the same site. The site serving the request cannot be dropped
+either — that would take the database out from under the caller mid-request.
+
+Enqueued like the rest: backing up a large site runs past the HTTP timeout. Poll:
+
+**`GET /api/method/saas_bridge.api.get_site_drop_status?site=client1.example.com`**
+
+`queued`, `running`, `success` or `failed`, with the bench error in `error` and the archive
+path in `archive`. Kept for 24 hours, separately from the provisioning and app-change
+state.
+
+On a containerised bench `archived/` sits inside the container, not on the shared sites
+volume, so archives left at the default path die with the container. Point them at the
+volume:
+
+```bash
+docker compose exec backend bench --site <control-site> \
+	set-config saas_bridge_archived_sites_path '/home/frappe/frappe-bench/sites/archived'
 ```
 
 **`POST /api/method/saas_bridge.api.set_site_limits`**

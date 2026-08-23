@@ -30,10 +30,11 @@ MAX_USERS_KEY = "saas_bridge_max_users"
 # the app that enforces the limit on the site itself. A site without it takes the config
 # key and ignores it, which is worth saying out loud rather than leaving to be discovered
 LIMIT_ENFORCED_BY = "habibi_core"
-# the two kinds of run this app keeps state for, kept apart so an app change does not
+# the kinds of run this app keeps state for, kept apart so an app change does not
 # overwrite the record of how the site was created
 PROVISION_STATE = "provision"
 APPS_STATE = "apps"
+DROP_STATE = "drop"
 DEFAULT_TIMEOUT = 30 * 60
 DEFAULT_COMMAND_TIMEOUT = 5 * 60
 STATE_TTL = 24 * 60 * 60
@@ -445,6 +446,17 @@ def db_root_password():
 	frappe.throw("Database root password missing — set `saas_bridge_db_root_password` in site config")
 
 
+def archived_sites_path():
+	"""Where `drop-site` should put the archived site directory.
+
+	Worth setting on a containerised bench: `archived/sites` is usually inside the
+	container rather than on the shared sites volume, so archives left at the default
+	path die with the container that made them.
+	"""
+	configured = frappe.conf.get("saas_bridge_archived_sites_path")
+	return str(configured) if configured else None
+
+
 def extra_new_site_args():
 	"""Bench specific flags to append to `new-site`.
 
@@ -649,6 +661,62 @@ def provision_site(
 		raise
 
 	return set_state(site, status="success", finished_at=now())
+
+
+def drop_site(site, backup=1):
+	"""Background job: take a site off the bench, keeping its files in `archived/sites`.
+
+	`bench drop-site` drops the database and the database user, and *moves* the site
+	directory into `archived/sites` rather than deleting it. The database is not moved
+	anywhere — so the backup taken first is the only thing that can bring the site back,
+	and skipping it makes the removal final for everything except the site's files.
+
+	The backup lands in the site's own `private/backups` and travels with the directory
+	into the archive, which is what makes the archive restorable on its own.
+	"""
+	timeout = step_timeout()
+	root_password = None
+
+	# state goes to `running` before anything that can fail, so a misconfigured bench is
+	# reported as a failure instead of leaving the run stuck on `queued` forever
+	set_state(site, kind=DROP_STATE, status="running", started_at=now(), error=None)
+
+	try:
+		root_password = db_root_password()
+		ensure_site_exists(site)
+
+		args = [
+			bench_command(),
+			"drop-site",
+			site,
+			"--db-root-password",
+			root_password,
+			# without --force a site whose database is already unreachable can never be
+			# dropped, and those are exactly the ones worth getting rid of
+			"--force",
+		]
+		if not backup:
+			args.append("--no-backup")
+
+		archive_path = archived_sites_path()
+		if archive_path:
+			args += ["--archived-sites-path", archive_path]
+
+		run(args, f"`bench drop-site {site}`", [root_password], timeout)
+
+	except Exception as exc:
+		message = scrub(str(exc), [root_password])
+		set_state(site, kind=DROP_STATE, status="failed", error=message, finished_at=now())
+		frappe.log_error(title=f"SaaS Bridge: dropping {site} failed", message=message)
+		raise
+
+	return set_state(
+		site,
+		kind=DROP_STATE,
+		status="success",
+		finished_at=now(),
+		archive=archived_sites_path() or os.path.join(get_bench_path(), "archived", "sites"),
+	)
 
 
 def change_site_apps(site, install=None, uninstall=None, backup=1):

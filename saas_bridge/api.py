@@ -236,6 +236,91 @@ def get_site_apps(site=None):
 
 
 @frappe.whitelist(methods=["POST"])
+def drop_site(site=None, backup=1):
+	"""Take a site off this bench, keeping its files in `archived/sites`.
+
+	`bench drop-site` drops the database and the database user and moves the site
+	directory into the archive. The database itself is not archived, so the backup taken
+	first (`backup`, on by default) is what makes the removal reversible — pass `0` only
+	when the data is genuinely disposable.
+
+	Validated synchronously and enqueued: backing up a large site runs well past the HTTP
+	timeout. Poll `get_site_drop_status`.
+	"""
+	frappe.only_for("System Manager")
+
+	site = provision.ensure_site_exists(provision.normalize_site_name(site))
+
+	# the site serving this request is the one running this code: dropping it would take
+	# the database out from under the caller mid-request
+	if site == frappe.local.site:
+		frappe.throw(f"{site} is the site serving this request — drop it with bench")
+
+	backup = 1 if cint(backup) else 0
+
+	# fail here rather than in the worker, where a config gap only surfaces on polling
+	provision.bench_command()
+	provision.db_root_password()
+
+	# a site still being built is being written to by another job right now, and its
+	# directory may not even be complete yet
+	provisioning = provision.get_state(site)
+	if provisioning and provisioning.get("status") in ("queued", "running"):
+		frappe.throw(f"{site} is still being provisioned")
+
+	apps_run = provision.get_state(site, kind=provision.APPS_STATE)
+	if apps_run and apps_run.get("status") in ("queued", "running"):
+		frappe.throw(f"App changes on {site} are still running")
+
+	job_id = f"saas-bridge-drop-{site}"
+	state = provision.get_state(site, kind=provision.DROP_STATE)
+	if (state and state.get("status") in ("queued", "running")) or is_job_enqueued(job_id):
+		frappe.throw(f"{site} is already being dropped")
+
+	provision.set_state(
+		site,
+		kind=provision.DROP_STATE,
+		status="queued",
+		backup=backup,
+		queued_at=now(),
+		error=None,
+		# the previous run's timestamps are still in this key, and a queued run showing when
+		# some earlier one started reads as progress it has not made
+		started_at=None,
+		finished_at=None,
+		archive=None,
+	)
+
+	job = frappe.enqueue(
+		"saas_bridge.provision.drop_site",
+		queue="long",
+		# the backup is the slow half, and it may take the full step timeout on its own
+		timeout=2 * provision.step_timeout() + 60,
+		job_id=job_id,
+		deduplicate=True,
+		site=site,
+		backup=backup,
+	)
+
+	if job is None:
+		frappe.throw(f"{site} is already being dropped")
+
+	return {"site": site, "backup": backup, "status": "queued", "job_id": job.id}
+
+
+@frappe.whitelist()
+def get_site_drop_status(site=None):
+	"""Progress of a `drop_site` call: queued, running, success or failed."""
+	frappe.only_for("System Manager")
+
+	site = provision.normalize_site_name(site)
+	state = provision.get_state(site, kind=provision.DROP_STATE)
+	if not state:
+		frappe.throw(f"No removal recorded for {site}")
+	return state
+
+
+@frappe.whitelist(methods=["POST"])
 def set_site_limits(site=None, max_users=None):
 	"""Set the number of users a site may have.
 
